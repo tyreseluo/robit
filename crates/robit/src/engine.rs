@@ -1,9 +1,13 @@
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::adapter::Adapter;
+use crate::ai::{AiChatMessage, AiChatRole, AiClient, AiDecision};
 use crate::protocol::{
     ActionListResultPayload, ApprovalDecisionPayload, ConfigMode, ConfigUpdatePayload,
     ProtocolBody, ProtocolEvent, ResponsePayload, RoomScopePayload,
@@ -73,6 +77,131 @@ impl ApprovalStore {
     }
 }
 
+struct ConversationStore {
+    max_messages: usize,
+    history: HashMap<(String, String), Vec<AiChatMessage>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedConversation {
+    workspace_id: String,
+    room_id: String,
+    messages: Vec<AiChatMessage>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedStore {
+    max_messages: usize,
+    conversations: Vec<PersistedConversation>,
+}
+
+impl ConversationStore {
+    fn new(max_messages: usize) -> Self {
+        Self {
+            max_messages: max_messages.max(2),
+            history: HashMap::new(),
+        }
+    }
+
+    fn key_for(&self, msg: &InboundMessage) -> (String, String) {
+        let workspace = msg
+            .workspace_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        (workspace, msg.channel.clone())
+    }
+
+    fn key_for_parts(&self, workspace_id: &str, room_id: &str) -> (String, String) {
+        (workspace_id.to_string(), room_id.to_string())
+    }
+
+    fn history_for(&self, key: &(String, String)) -> Vec<AiChatMessage> {
+        self.history.get(key).cloned().unwrap_or_default()
+    }
+
+    fn record_exchange(
+        &mut self,
+        key: &(String, String),
+        user_input: &str,
+        replies: &[OutboundMessage],
+    ) {
+        let entry = self.history.entry(key.clone()).or_default();
+        entry.push(AiChatMessage {
+            role: AiChatRole::User,
+            content: user_input.trim().to_string(),
+        });
+        for reply in replies {
+            if reply.text.trim().is_empty() {
+                continue;
+            }
+            entry.push(AiChatMessage {
+                role: AiChatRole::Assistant,
+                content: reply.text.trim().to_string(),
+            });
+        }
+        if entry.len() > self.max_messages {
+            let start = entry.len().saturating_sub(self.max_messages);
+            entry.drain(0..start);
+        }
+    }
+
+    fn record_context(&mut self, key: &(String, String), role: AiChatRole, content: &str) {
+        let text = content.trim();
+        if text.is_empty() {
+            return;
+        }
+        let entry = self.history.entry(key.clone()).or_default();
+        entry.push(AiChatMessage {
+            role,
+            content: text.to_string(),
+        });
+        if entry.len() > self.max_messages {
+            let start = entry.len().saturating_sub(self.max_messages);
+            entry.drain(0..start);
+        }
+    }
+
+    fn load_from_path(&mut self, path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let content = fs::read_to_string(path)?;
+        let store: PersistedStore = serde_json::from_str(&content)?;
+        self.history.clear();
+        for convo in store.conversations {
+            let key = (convo.workspace_id, convo.room_id);
+            let mut messages = convo.messages;
+            if messages.len() > self.max_messages {
+                let start = messages.len().saturating_sub(self.max_messages);
+                messages.drain(0..start);
+            }
+            self.history.insert(key, messages);
+        }
+        Ok(())
+    }
+
+    fn save_to_path(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut conversations = Vec::new();
+        for ((workspace_id, room_id), messages) in &self.history {
+            conversations.push(PersistedConversation {
+                workspace_id: workspace_id.clone(),
+                room_id: room_id.clone(),
+                messages: messages.clone(),
+            });
+        }
+        let store = PersistedStore {
+            max_messages: self.max_messages,
+            conversations,
+        };
+        let data = serde_json::to_string_pretty(&store)?;
+        fs::write(path, data)?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ApprovalDecision {
     Approve,
@@ -82,12 +211,15 @@ enum ApprovalDecision {
 pub struct Engine {
     registry: ActionRegistry,
     planner: RulePlanner,
+    ai_client: Option<AiClient>,
     ctx: ActionContext,
     approvals: ApprovalStore,
     next_message_id: u64,
     seen_messages: HashSet<String>,
     scope: RoomScope,
     config_store: ConfigStore,
+    conversations: ConversationStore,
+    conversation_persist_path: Option<PathBuf>,
 }
 
 impl Engine {
@@ -96,6 +228,7 @@ impl Engine {
         Ok(Self {
             registry,
             planner,
+            ai_client: None,
             ctx: ActionContext {
                 cwd,
                 dry_run: true,
@@ -106,7 +239,20 @@ impl Engine {
             seen_messages: HashSet::new(),
             scope: RoomScope::default(),
             config_store: ConfigStore::default(),
+            conversations: ConversationStore::new(50),
+            conversation_persist_path: None,
         })
+    }
+
+    pub fn set_ai_client(&mut self, ai_client: Option<AiClient>) {
+        self.ai_client = ai_client;
+    }
+
+    pub fn enable_conversation_persistence(&mut self, path: PathBuf) {
+        self.conversation_persist_path = Some(path.clone());
+        if let Err(err) = self.conversations.load_from_path(&path) {
+            eprintln!("robit context load failed: {err}");
+        }
     }
 
     pub fn handle_message(&mut self, msg: InboundMessage) -> Vec<OutboundMessage> {
@@ -127,6 +273,25 @@ impl Engine {
                     return Vec::new();
                 }
                 self.seen_messages.insert(payload.message_id.clone());
+                let convo_key = self
+                    .conversations
+                    .key_for_parts(&payload.workspace_id, &payload.room_id);
+                if payload
+                    .metadata
+                    .get("context_only")
+                    .and_then(|value| value.as_bool())
+                    == Some(true)
+                {
+                    let role = payload
+                        .metadata
+                        .get("role")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.to_lowercase())
+                        .map(|value| if value == "assistant" { AiChatRole::Assistant } else { AiChatRole::User })
+                        .unwrap_or(AiChatRole::User);
+                    self.record_context_and_persist(&convo_key, role, &payload.text);
+                    return Vec::new();
+                }
                 let room_cfg = self
                     .config_store
                     .effective_for(&payload.workspace_id, &payload.room_id);
@@ -191,32 +356,66 @@ impl Engine {
             return Vec::new();
         }
 
+        let convo_key = self.conversations.key_for(&msg);
+
         if let Some(response) = self.handle_control(&msg) {
+            self.record_exchange_and_persist(&convo_key, text, &[response.clone()]);
             return vec![response];
         }
 
         if let Some(response) = self.handle_approval(&msg) {
+            self.record_exchange_and_persist(&convo_key, text, &response);
             return response;
+        }
+
+        let history = self.conversations.history_for(&convo_key);
+        if let Some(ai_client) = &self.ai_client {
+            match ai_client.plan_with_history(text, &self.registry.list_specs(), &history) {
+                Ok(AiDecision::Action(request)) => {
+                    let replies = self.handle_action_request(&msg, request, room_cfg);
+                    self.record_exchange_and_persist(&convo_key, text, &replies);
+                    return replies;
+                }
+                Ok(AiDecision::NeedInput { prompt }) => {
+                    let reply = self.reply(
+                        &msg,
+                        prompt,
+                        "need_input",
+                        serde_json::Value::Null,
+                    );
+                    self.record_exchange_and_persist(&convo_key, text, &[reply.clone()]);
+                    return vec![reply];
+                }
+                Ok(AiDecision::Unknown { .. }) => {}
+                Err(err) => {
+                    eprintln!("robit ai error: {err}");
+                }
+            }
         }
 
         match self.planner.plan(text) {
             PlannerResponse::Action(request) => {
-                self.handle_action_request(&msg, request, room_cfg)
+                let replies = self.handle_action_request(&msg, request, room_cfg);
+                self.record_exchange_and_persist(&convo_key, text, &replies);
+                replies
             }
-            PlannerResponse::NeedInput { prompt } => vec![self.reply(
-                &msg,
-                prompt,
-                "need_input",
-                serde_json::Value::Null,
-            )],
-            PlannerResponse::Unknown { message } => vec![self.reply(
-                &msg,
-                format!(
-                    "我还没学会处理这个请求（{message}）。可以试试输入 actions 查看动作列表，或用 action:xxx 明确指令。",
-                ),
-                "unknown",
-                serde_json::Value::Null,
-            )],
+            PlannerResponse::NeedInput { prompt } => {
+                let reply = self.reply(&msg, prompt, "need_input", serde_json::Value::Null);
+                self.record_exchange_and_persist(&convo_key, text, &[reply.clone()]);
+                vec![reply]
+            }
+            PlannerResponse::Unknown { message } => {
+                let reply = self.reply(
+                    &msg,
+                    format!(
+                        "我还没学会处理这个请求（{message}）。可以试试输入 actions 查看动作列表，或用 action:xxx 明确指令。",
+                    ),
+                    "unknown",
+                    serde_json::Value::Null,
+                );
+                self.record_exchange_and_persist(&convo_key, text, &[reply.clone()]);
+                vec![reply]
+            }
         }
     }
 
@@ -426,6 +625,36 @@ impl Engine {
         let id = self.next_message_id;
         self.next_message_id += 1;
         format!("out-{id}")
+    }
+
+    fn record_exchange_and_persist(
+        &mut self,
+        key: &(String, String),
+        user_input: &str,
+        replies: &[OutboundMessage],
+    ) {
+        self.conversations
+            .record_exchange(key, user_input, replies);
+        self.persist_conversations();
+    }
+
+    fn record_context_and_persist(
+        &mut self,
+        key: &(String, String),
+        role: AiChatRole,
+        content: &str,
+    ) {
+        self.conversations.record_context(key, role, content);
+        self.persist_conversations();
+    }
+
+    fn persist_conversations(&self) {
+        let Some(path) = &self.conversation_persist_path else {
+            return;
+        };
+        if let Err(err) = self.conversations.save_to_path(path) {
+            eprintln!("robit context save failed: {err}");
+        }
     }
 
     fn help_text(&self) -> String {

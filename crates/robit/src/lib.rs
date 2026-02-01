@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod actions;
+pub mod ai;
 pub mod engine;
 pub mod protocol;
 pub mod planner;
@@ -8,6 +9,7 @@ pub mod types;
 pub mod utils;
 
 pub use actions::{ActionHandler, ActionRegistry};
+pub use ai::{AiChatMessage, AiChatRole, AiClient, AiConfig, AiDecision, AiProvider};
 pub use engine::Engine;
 pub use protocol::{
     ActionListRequestPayload, ActionListResultPayload, ApprovalDecisionPayload, ConfigMode,
