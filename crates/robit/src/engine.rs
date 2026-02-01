@@ -327,16 +327,14 @@ impl Engine {
         }
 
         if needs_approval {
+            let params_snapshot = request.params.clone();
             let approval_id = self.approvals.create(
                 &msg.sender,
                 request,
                 spec.clone(),
                 room_cfg.clone(),
             );
-            let text = format!(
-                "approval required for '{}'. reply 'approve {}' or 'deny {}'",
-                spec.name, approval_id, approval_id
-            );
+            let text = format_approval_prompt(&spec, &params_snapshot, &ctx, &approval_id);
             return vec![self.reply(
                 msg,
                 text,
@@ -556,6 +554,62 @@ fn parse_approval_command(input: &str) -> Option<(ApprovalDecision, Option<Strin
     }
 
     None
+}
+
+fn format_approval_prompt(
+    spec: &ActionSpec,
+    params: &serde_json::Value,
+    ctx: &ActionContext,
+    approval_id: &str,
+) -> String {
+    let risk = match spec.risk {
+        RiskLevel::Low => "low",
+        RiskLevel::Medium => "medium",
+        RiskLevel::High => "high",
+    };
+    let params_text = format_params_compact(params);
+    format!(
+        "需要审批：{name}\n描述：{desc}\n风险：{risk}  |  dry-run：{dry_run}\n参数：{params}\n回复 approve {id} 执行，或 deny {id} 取消",
+        name = spec.name,
+        desc = spec.description,
+        risk = risk,
+        dry_run = ctx.dry_run,
+        params = params_text,
+        id = approval_id
+    )
+}
+
+fn format_params_compact(params: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match params {
+        Value::Null => "none".to_string(),
+        Value::Object(map) => {
+            if map.is_empty() {
+                return "none".to_string();
+            }
+            let mut parts = Vec::new();
+            for (key, value) in map.iter().take(4) {
+                parts.push(format!("{}={}", key, compact_value(value)));
+            }
+            if map.len() > 4 {
+                parts.push("...".to_string());
+            }
+            parts.join(", ")
+        }
+        _ => compact_value(params),
+    }
+}
+
+fn compact_value(value: &serde_json::Value) -> String {
+    let raw = match value {
+        serde_json::Value::String(text) => text.clone(),
+        _ => value.to_string(),
+    };
+    if raw.len() > 60 {
+        format!("{}...", &raw[..57])
+    } else {
+        raw
+    }
 }
 
 #[derive(Clone, Default)]
