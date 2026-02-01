@@ -9,7 +9,11 @@ pub mod types;
 pub mod utils;
 
 pub use actions::{ActionHandler, ActionRegistry};
-pub use ai::{AiChatMessage, AiChatRole, AiClient, AiConfig, AiDecision, AiProvider};
+pub use ai::{AiChatMessage, AiChatRole, AiDecision, AiPlanner};
+#[cfg(feature = "ai-http")]
+pub use ai::{AiClient, AiConfig, AiProvider};
+#[cfg(feature = "ai-omnix-mlx")]
+pub use ai::{MlxQwenClient, MlxQwenConfig};
 pub use engine::Engine;
 pub use protocol::{
     ActionListRequestPayload, ActionListResultPayload, ApprovalDecisionPayload, ConfigMode,

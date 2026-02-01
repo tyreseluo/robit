@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -11,7 +10,17 @@ use crate::types::{ActionRequest, ActionSpec};
 pub enum AiDecision {
     Action(ActionRequest),
     NeedInput { prompt: String },
+    Chat { message: String },
     Unknown { message: String },
+}
+
+pub trait AiPlanner: Send + Sync {
+    fn plan_with_history(
+        &self,
+        input: &str,
+        actions: &[ActionSpec],
+        history: &[AiChatMessage],
+    ) -> Result<AiDecision>;
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -26,12 +35,17 @@ pub struct AiChatMessage {
     pub content: String,
 }
 
+#[cfg(feature = "ai-http")]
+use reqwest::blocking::Client;
+
+#[cfg(feature = "ai-http")]
 #[derive(Clone, Copy, Debug)]
 pub enum AiProvider {
     OpenAI,
     DeepSeek,
 }
 
+#[cfg(feature = "ai-http")]
 #[derive(Clone, Debug)]
 pub struct AiConfig {
     pub provider: AiProvider,
@@ -41,6 +55,7 @@ pub struct AiConfig {
     pub temperature: Option<f64>,
 }
 
+#[cfg(feature = "ai-http")]
 #[derive(Clone, Debug)]
 pub struct AiClient {
     client: Client,
@@ -50,6 +65,7 @@ pub struct AiClient {
     temperature: f64,
 }
 
+#[cfg(feature = "ai-http")]
 impl AiClient {
     pub fn new(config: AiConfig) -> Result<Self> {
         if config.api_key.trim().is_empty() {
@@ -85,10 +101,11 @@ impl AiClient {
         actions: &[ActionSpec],
         history: &[AiChatMessage],
     ) -> Result<AiDecision> {
-        let system = system_prompt();
+        let system = system_prompt_with_backend(Some(&self.model));
         let action_specs = serde_json::to_string(actions).unwrap_or_else(|_| "[]".to_string());
         let user = format!(
-            "User request:\n{input}\n\nAvailable actions (JSON):\n{action_specs}\n\nReturn JSON only.",
+            "{system}\n\nUser request:\n{input}\n\nAvailable actions (JSON):\n{action_specs}\n\nReturn JSON only.",
+            system = system,
             input = input,
             action_specs = action_specs
         );
@@ -130,7 +147,224 @@ impl AiClient {
             .unwrap_or("");
         parse_decision(content, input)
     }
+
+    pub fn model_name(&self) -> &str {
+        &self.model
+    }
 }
+
+#[cfg(feature = "ai-http")]
+impl AiPlanner for AiClient {
+    fn plan_with_history(
+        &self,
+        input: &str,
+        actions: &[ActionSpec],
+        history: &[AiChatMessage],
+    ) -> Result<AiDecision> {
+        AiClient::plan_with_history(self, input, actions, history)
+    }
+}
+
+#[cfg(feature = "ai-omnix-mlx")]
+mod omnix {
+    use super::{
+        parse_decision, system_prompt_with_backend, AiChatMessage, AiChatRole, AiDecision,
+        AiPlanner, ActionSpec,
+    };
+    use anyhow::{anyhow, Context, Result};
+    use mlx_lm_utils::tokenizer::{
+        load_model_chat_template_from_file, ApplyChatTemplateArgs, Conversation, Role, Tokenizer,
+    };
+    use mlx_rs::ops::indexing::{IndexOp, NewAxis};
+    use mlx_rs::transforms::eval;
+    use mlx_rs::Array;
+    use qwen3_mlx::{load_model, Generate, KVCache, Model};
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Debug)]
+    pub struct MlxQwenConfig {
+        pub model_dir: PathBuf,
+        pub temperature: f32,
+        pub max_tokens: usize,
+    }
+
+    pub struct MlxQwenClient {
+        model: Mutex<Model>,
+        tokenizer: Mutex<Tokenizer>,
+        chat_template: String,
+        model_id: String,
+        temperature: f32,
+        max_tokens: usize,
+    }
+
+    impl MlxQwenClient {
+        pub fn new(config: MlxQwenConfig) -> Result<Self> {
+            let model_dir = config.model_dir;
+            if !model_dir.exists() {
+                return Err(anyhow!(
+                    "model dir not found: {}",
+                    model_dir.display()
+                ));
+            }
+            for required in [
+                "config.json",
+                "model.safetensors.index.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+            ] {
+                let path = model_dir.join(required);
+                if !path.is_file() {
+                    return Err(anyhow!(
+                        "missing required model file: {}",
+                        path.display()
+                    ));
+                }
+            }
+            let model_id = model_dir
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("qwen3")
+                .to_string();
+
+            let tokenizer_file = model_dir.join("tokenizer.json");
+            let tokenizer_config_file = model_dir.join("tokenizer_config.json");
+            let tokenizer = Tokenizer::from_file(&tokenizer_file)
+                .map_err(|err| anyhow!("failed to load tokenizer: {err:?}"))?;
+            let chat_template = load_model_chat_template_from_file(&tokenizer_config_file)?
+                .ok_or_else(|| anyhow!("chat template not found in tokenizer_config.json"))?;
+
+            let model = load_model(&model_dir).context("failed to load qwen3 model")?;
+
+            Ok(Self {
+                model: Mutex::new(model),
+                tokenizer: Mutex::new(tokenizer),
+                chat_template,
+                model_id,
+                temperature: config.temperature,
+                max_tokens: config.max_tokens,
+            })
+        }
+
+        fn build_conversation(
+            &self,
+            input: &str,
+            actions_json: &str,
+            history: &[AiChatMessage],
+        ) -> Vec<Conversation<Role, String>> {
+            let mut conversations = Vec::new();
+            for message in history {
+                let role = match message.role {
+                    AiChatRole::User => Role::User,
+                    AiChatRole::Assistant => Role::Assistant,
+                };
+                conversations.push(Conversation {
+                    role,
+                    content: message.content.clone(),
+                });
+            }
+            let system = system_prompt_with_backend(Some(&self.model_id));
+            let user = format!(
+                "{system}\n\nUser request:\n{input}\n\nAvailable actions (JSON):\n{actions_json}\n\nReturn JSON only.",
+                system = system,
+                input = input,
+                actions_json = actions_json
+            );
+            conversations.push(Conversation {
+                role: Role::User,
+                content: user,
+            });
+            conversations
+        }
+
+        fn encode_prompt(
+            &self,
+            conversations: Vec<Conversation<Role, String>>,
+        ) -> Result<Array> {
+            let mut tokenizer = self.tokenizer.lock().unwrap();
+            let args = ApplyChatTemplateArgs {
+                conversations: vec![conversations.into()],
+                documents: None,
+                model_id: &self.model_id,
+                chat_template_id: None,
+                add_generation_prompt: None,
+                continue_final_message: None,
+            };
+            let encodings = tokenizer
+                .apply_chat_template_and_encode(self.chat_template.clone(), args)
+                .context("failed to apply chat template")?;
+            let prompt: Vec<u32> = encodings
+                .iter()
+                .flat_map(|encoding| encoding.get_ids())
+                .copied()
+                .collect();
+            Ok(Array::from(&prompt[..]).index(NewAxis))
+        }
+
+        fn generate_text(&self, prompt_tokens: &Array) -> Result<String> {
+            let mut model = self.model.lock().unwrap();
+            let mut cache = Vec::new();
+            let generator =
+                Generate::<KVCache>::new(&mut *model, &mut cache, self.temperature, prompt_tokens);
+
+            let mut tokens = Vec::new();
+            let mut output = String::new();
+
+            for (i, token) in generator.enumerate() {
+                let token = token?;
+                let token_id = token.item::<u32>();
+                if token_id == 151643 || token_id == 151645 {
+                    break;
+                }
+                tokens.push(token);
+                if tokens.len() % 5 == 0 {
+                    self.decode_tokens(&mut tokens, &mut output)?;
+                }
+                if i >= self.max_tokens.saturating_sub(1) {
+                    break;
+                }
+            }
+            if !tokens.is_empty() {
+                self.decode_tokens(&mut tokens, &mut output)?;
+            }
+            Ok(output)
+        }
+
+        fn decode_tokens(&self, tokens: &mut Vec<Array>, output: &mut String) -> Result<()> {
+            eval(tokens.iter())?;
+            let slice: Vec<u32> = tokens.drain(..).map(|t| t.item::<u32>()).collect();
+            if slice.is_empty() {
+                return Ok(());
+            }
+            let mut tokenizer = self.tokenizer.lock().unwrap();
+            let text = tokenizer
+                .decode(&slice, true)
+                .map_err(|err| anyhow!("decode error: {err:?}"))?;
+            output.push_str(&text);
+            Ok(())
+        }
+    }
+
+    impl AiPlanner for MlxQwenClient {
+        fn plan_with_history(
+            &self,
+            input: &str,
+            actions: &[ActionSpec],
+            history: &[AiChatMessage],
+        ) -> Result<AiDecision> {
+            let actions_json =
+                serde_json::to_string(actions).unwrap_or_else(|_| "[]".to_string());
+            let conversations = self.build_conversation(input, &actions_json, history);
+            let prompt_tokens = self.encode_prompt(conversations)?;
+            let response = self.generate_text(&prompt_tokens)?;
+            parse_decision(response.trim(), input)
+        }
+    }
+
+}
+
+#[cfg(feature = "ai-omnix-mlx")]
+pub use omnix::{MlxQwenClient, MlxQwenConfig};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct AiDecisionPayload {
@@ -149,16 +383,31 @@ struct AiDecisionPayload {
 }
 
 fn parse_decision(content: &str, raw_input: &str) -> Result<AiDecision> {
-    let json_text = extract_json(content).unwrap_or_else(|| content.trim().to_string());
-    let payload: AiDecisionPayload = serde_json::from_str(&json_text)
-        .unwrap_or(AiDecisionPayload {
-            r#type: "unknown".to_string(),
-            name: None,
-            action: None,
-            params: None,
-            message: Some("AI response was not valid JSON".to_string()),
-            prompt: None,
-        });
+    let trimmed = content.trim();
+    let json_text = extract_json(content);
+    let payload = if let Some(json_text) = json_text {
+        serde_json::from_str::<AiDecisionPayload>(&json_text).ok()
+    } else {
+        None
+    };
+    let payload = match payload {
+        Some(payload) => payload,
+        None => {
+            if !trimmed.is_empty() {
+                return Ok(AiDecision::Chat {
+                    message: trimmed.to_string(),
+                });
+            }
+            AiDecisionPayload {
+                r#type: "unknown".to_string(),
+                name: None,
+                action: None,
+                params: None,
+                message: Some("AI response was empty".to_string()),
+                prompt: None,
+            }
+        }
+    };
 
     let ty = payload.r#type.to_lowercase();
     if ty == "action" || payload.name.is_some() || payload.action.is_some() {
@@ -181,6 +430,13 @@ fn parse_decision(content: &str, raw_input: &str) -> Result<AiDecision> {
         return Ok(AiDecision::NeedInput { prompt });
     }
 
+    if ty == "chat" {
+        let message = payload
+            .message
+            .unwrap_or_else(|| "".to_string());
+        return Ok(AiDecision::Chat { message });
+    }
+
     let message = payload
         .message
         .unwrap_or_else(|| "no plan".to_string());
@@ -200,14 +456,31 @@ fn extract_json(content: &str) -> Option<String> {
     Some(trimmed[start..=end].to_string())
 }
 
-fn system_prompt() -> &'static str {
+fn system_prompt_base() -> &'static str {
     "You are an action planner for robit.\n\
 Return JSON only, no markdown, no extra text.\n\
 Allowed output schemas:\n\
 1) {\"type\":\"action\",\"name\":\"...\",\"params\":{...}}\n\
 2) {\"type\":\"need_input\",\"prompt\":\"...\"}\n\
-3) {\"type\":\"unknown\",\"message\":\"...\"}\n\
+3) {\"type\":\"chat\",\"message\":\"...\"}\n\
+4) {\"type\":\"unknown\",\"message\":\"...\"}\n\
 Pick an action only from the provided action list.\n\
 Use conversation context to fill missing details.\n\
+If the user is chatting or the request doesn't map to an action, respond with type=chat.\n\
 If the user mentions desktop/桌面, interpret as ~/Desktop."
+}
+
+fn system_prompt_with_backend(backend: Option<&str>) -> String {
+    let mut prompt = system_prompt_base().to_string();
+    if let Some(label) = backend {
+        let label = label.trim();
+        if !label.is_empty() {
+            prompt.push_str("\nCurrent model/backend: ");
+            prompt.push_str(label);
+            prompt.push_str(
+                ". If the user asks about the model or backend, answer using this value.",
+            );
+        }
+    }
+    prompt
 }

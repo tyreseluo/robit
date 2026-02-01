@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::adapter::Adapter;
-use crate::ai::{AiChatMessage, AiChatRole, AiClient, AiDecision};
+use crate::ai::{AiChatMessage, AiChatRole, AiDecision, AiPlanner};
 use crate::protocol::{
     ActionListResultPayload, ApprovalDecisionPayload, ConfigMode, ConfigUpdatePayload,
     ProtocolBody, ProtocolEvent, ResponsePayload, RoomScopePayload,
@@ -211,7 +211,8 @@ enum ApprovalDecision {
 pub struct Engine {
     registry: ActionRegistry,
     planner: RulePlanner,
-    ai_client: Option<AiClient>,
+    ai_backend: Option<std::sync::Arc<dyn AiPlanner>>,
+    ai_backend_label: Option<String>,
     ctx: ActionContext,
     approvals: ApprovalStore,
     next_message_id: u64,
@@ -228,7 +229,8 @@ impl Engine {
         Ok(Self {
             registry,
             planner,
-            ai_client: None,
+            ai_backend: None,
+            ai_backend_label: None,
             ctx: ActionContext {
                 cwd,
                 dry_run: true,
@@ -244,8 +246,28 @@ impl Engine {
         })
     }
 
-    pub fn set_ai_client(&mut self, ai_client: Option<AiClient>) {
-        self.ai_client = ai_client;
+    pub fn set_ai_backend(&mut self, backend: Option<std::sync::Arc<dyn AiPlanner>>) {
+        self.set_ai_backend_with_label(backend, None);
+    }
+
+    pub fn set_ai_backend_with_label(
+        &mut self,
+        backend: Option<std::sync::Arc<dyn AiPlanner>>,
+        label: Option<String>,
+    ) {
+        self.ai_backend = backend;
+        self.ai_backend_label = label;
+    }
+
+    #[cfg(feature = "ai-http")]
+    pub fn set_ai_client(&mut self, ai_client: Option<crate::ai::AiClient>) {
+        let label = ai_client
+            .as_ref()
+            .map(|client| format!("http:{}", client.model_name()));
+        let backend = ai_client.map(|client| {
+            std::sync::Arc::new(client) as std::sync::Arc<dyn AiPlanner>
+        });
+        self.set_ai_backend_with_label(backend, label);
     }
 
     pub fn enable_conversation_persistence(&mut self, path: PathBuf) {
@@ -253,6 +275,28 @@ impl Engine {
         if let Err(err) = self.conversations.load_from_path(&path) {
             eprintln!("robit context load failed: {err}");
         }
+    }
+
+    fn conversation_key_for(&self, msg: &InboundMessage) -> (String, String) {
+        let (workspace_id, room_id) = self.conversations.key_for(msg);
+        self.decorate_conversation_key(workspace_id, room_id)
+    }
+
+    fn conversation_key_parts(&self, workspace_id: &str, room_id: &str) -> (String, String) {
+        self.decorate_conversation_key(workspace_id.to_string(), room_id.to_string())
+    }
+
+    fn decorate_conversation_key(
+        &self,
+        workspace_id: String,
+        room_id: String,
+    ) -> (String, String) {
+        let decorated_room = if let Some(label) = self.ai_backend_label.as_deref() {
+            format!("{room_id}::ai={label}")
+        } else {
+            room_id
+        };
+        (workspace_id, decorated_room)
     }
 
     pub fn handle_message(&mut self, msg: InboundMessage) -> Vec<OutboundMessage> {
@@ -273,9 +317,7 @@ impl Engine {
                     return Vec::new();
                 }
                 self.seen_messages.insert(payload.message_id.clone());
-                let convo_key = self
-                    .conversations
-                    .key_for_parts(&payload.workspace_id, &payload.room_id);
+                let convo_key = self.conversation_key_parts(&payload.workspace_id, &payload.room_id);
                 if payload
                     .metadata
                     .get("context_only")
@@ -356,7 +398,7 @@ impl Engine {
             return Vec::new();
         }
 
-        let convo_key = self.conversations.key_for(&msg);
+        let convo_key = self.conversation_key_for(&msg);
 
         if let Some(response) = self.handle_control(&msg) {
             self.record_exchange_and_persist(&convo_key, text, &[response.clone()]);
@@ -369,8 +411,8 @@ impl Engine {
         }
 
         let history = self.conversations.history_for(&convo_key);
-        if let Some(ai_client) = &self.ai_client {
-            match ai_client.plan_with_history(text, &self.registry.list_specs(), &history) {
+        if let Some(ai_backend) = &self.ai_backend {
+            match ai_backend.plan_with_history(text, &self.registry.list_specs(), &history) {
                 Ok(AiDecision::Action(request)) => {
                     let replies = self.handle_action_request(&msg, request, room_cfg);
                     self.record_exchange_and_persist(&convo_key, text, &replies);
@@ -386,7 +428,26 @@ impl Engine {
                     self.record_exchange_and_persist(&convo_key, text, &[reply.clone()]);
                     return vec![reply];
                 }
-                Ok(AiDecision::Unknown { .. }) => {}
+                Ok(AiDecision::Chat { message }) => {
+                    let reply_text = if message.trim().is_empty() {
+                        "我在这儿，可以继续说说你的需求。".to_string()
+                    } else {
+                        message
+                    };
+                    let reply = self.reply(&msg, reply_text, "chat", serde_json::Value::Null);
+                    self.record_exchange_and_persist(&convo_key, text, &[reply.clone()]);
+                    return vec![reply];
+                }
+                Ok(AiDecision::Unknown { message }) => {
+                    let reply_text = if message.trim().is_empty() {
+                        "我暂时没把握这个请求，可以再具体一点吗？".to_string()
+                    } else {
+                        message
+                    };
+                    let reply = self.reply(&msg, reply_text, "chat", serde_json::Value::Null);
+                    self.record_exchange_and_persist(&convo_key, text, &[reply.clone()]);
+                    return vec![reply];
+                }
                 Err(err) => {
                     eprintln!("robit ai error: {err}");
                 }
@@ -430,6 +491,12 @@ impl Engine {
             "actions" => Some(self.reply(
                 msg,
                 self.actions_text(),
+                "info",
+                serde_json::Value::Null,
+            )),
+            "backend" | "model" | "ai" => Some(self.reply(
+                msg,
+                self.backend_text(),
                 "info",
                 serde_json::Value::Null,
             )),
@@ -662,6 +729,7 @@ impl Engine {
         text.push_str("commands:\n");
         text.push_str("  help           show this help\n");
         text.push_str("  actions        list actions\n");
+        text.push_str("  backend        show ai backend\n");
         text.push_str("  dry-run on     enable dry-run mode\n");
         text.push_str("  dry-run off    disable dry-run mode\n");
         text.push_str("  approve <id>   approve pending action\n");
@@ -682,6 +750,15 @@ impl Engine {
             .collect();
         lines.sort();
         lines.join("\n")
+    }
+
+    fn backend_text(&self) -> String {
+        match (&self.ai_backend, &self.ai_backend_label) {
+            (Some(_), Some(label)) => format!("ai backend: {label}"),
+            (Some(_), None) => "ai backend: custom".to_string(),
+            (None, Some(label)) => format!("ai backend: {label}"),
+            (None, None) => "ai backend: none".to_string(),
+        }
     }
 
     fn build_context(&self, room_cfg: &RoomConfig) -> ActionContext {
