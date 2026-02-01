@@ -3,7 +3,6 @@ use anyhow::Result;
 use robit::actions::fs_organize::OrganizeDirectoryAction;
 use robit::actions::rust_project::RustProjectAction;
 use robit::adapter::stdin::StdinAdapter;
-use robit::adapter::Adapter;
 use robit::{ActionRegistry, Engine, Policy, RulePlanner};
 
 fn main() -> Result<()> {

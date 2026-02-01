@@ -49,6 +49,7 @@ impl Adapter for StdinAdapter {
             text,
             sender: "stdin".to_string(),
             channel: "stdin".to_string(),
+            workspace_id: Some("local".to_string()),
             metadata: Value::Null,
         }))
     }

@@ -46,6 +46,8 @@ pub struct InboundMessage {
     pub text: String,
     pub sender: String,
     pub channel: String,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     pub metadata: Value,
 }
 
@@ -56,5 +58,7 @@ pub struct OutboundMessage {
     pub text: String,
     pub recipient: String,
     pub channel: String,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     pub metadata: Value,
 }
