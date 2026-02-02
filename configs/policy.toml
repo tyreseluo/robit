@@ -1,0 +1,18 @@
+# Example policy configuration for Robit.
+# This file is loaded by default (configs/policy.toml or ROBIT_CONFIG_PATH).
+
+[preflight]
+enabled = true
+strict = true
+allowed_capabilities = ["filesystem", "shell", "process", "network", "browser"]
+denied_capabilities = ["system_control"]
+blocked_roots = ["/System", "/Library"]
+enforce_policy_roots = true
+path_keys = ["path", "dir", "directory", "cwd", "file", "target", "src", "dst", "source", "destination"]
+
+[policy]
+allowed_roots = ["~/Projects", "~/Desktop"]
+approval_risk_levels = ["medium", "high"]
+
+[risk]
+low_auto_execute = true

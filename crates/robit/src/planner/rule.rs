@@ -1,23 +1,12 @@
-use regex::Regex;
 use serde_json::{json, Value};
 
 use crate::types::{ActionRequest, PlannerResponse};
 
-pub struct RulePlanner {
-    rust_path_cn: Regex,
-    rust_name_cn: Regex,
-    rust_path_en: Regex,
-    rust_name_en: Regex,
-}
+pub struct RulePlanner;
 
 impl RulePlanner {
     pub fn new() -> Self {
-        Self {
-            rust_path_cn: Regex::new(r"在\s*(?P<path>[^\s]+)\s*下").unwrap(),
-            rust_name_cn: Regex::new(r"(名为|叫)\s*(?P<name>[^\s]+)").unwrap(),
-            rust_path_en: Regex::new(r"(?i)in\s+(?P<path>\S+)").unwrap(),
-            rust_name_en: Regex::new(r"(?i)named\s+(?P<name>\S+)").unwrap(),
-        }
+        Self
     }
 
     pub fn plan(&self, input: &str) -> PlannerResponse {
@@ -30,10 +19,6 @@ impl RulePlanner {
 
         if let Some(request) = self.parse_explicit_action(trimmed) {
             return PlannerResponse::Action(request);
-        }
-
-        if self.matches_rust_project(trimmed) {
-            return self.plan_rust_project(trimmed);
         }
 
         if self.matches_desktop_organize(trimmed) {
@@ -82,59 +67,6 @@ impl RulePlanner {
             params,
             raw_input: trimmed.to_string(),
         })
-    }
-
-    fn matches_rust_project(&self, input: &str) -> bool {
-        let lower = input.to_lowercase();
-        (lower.contains("rust") && (lower.contains("project") || input.contains("项目")))
-            && (lower.contains("new")
-                || lower.contains("create")
-                || input.contains("新建")
-                || input.contains("创建"))
-    }
-
-    fn plan_rust_project(&self, input: &str) -> PlannerResponse {
-        let path = self
-            .rust_path_cn
-            .captures(input)
-            .and_then(|cap| cap.name("path"))
-            .map(|m| m.as_str().to_string())
-            .or_else(|| {
-                self.rust_path_en
-                    .captures(input)
-                    .and_then(|cap| cap.name("path"))
-                    .map(|m| m.as_str().to_string())
-            })
-            .unwrap_or_else(|| ".".to_string());
-
-        let name = self
-            .rust_name_cn
-            .captures(input)
-            .and_then(|cap| cap.name("name"))
-            .map(|m| m.as_str().to_string())
-            .or_else(|| {
-                self.rust_name_en
-                    .captures(input)
-                    .and_then(|cap| cap.name("name"))
-                    .map(|m| m.as_str().to_string())
-            });
-
-        let run = input.contains("运行") || input.to_lowercase().contains("run");
-
-        match name {
-            Some(name) => PlannerResponse::Action(ActionRequest {
-                name: "rust.new_project".to_string(),
-                params: json!({
-                    "path": path,
-                    "name": name,
-                    "run": run
-                }),
-                raw_input: input.to_string(),
-            }),
-            None => PlannerResponse::NeedInput {
-                prompt: "project name is required (example: 名为 demo)".to_string(),
-            },
-        }
     }
 
     fn matches_desktop_organize(&self, input: &str) -> bool {

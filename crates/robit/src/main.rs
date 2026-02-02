@@ -1,15 +1,11 @@
 use anyhow::Result;
 
-use robit::actions::fs_organize::OrganizeDirectoryAction;
-use robit::actions::rust_project::RustProjectAction;
 use robit::adapter::stdin::StdinAdapter;
-use robit::{ActionRegistry, Engine, Policy, RulePlanner};
+use robit::{default_registry, Engine, Policy, RulePlanner};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
-    let mut registry = ActionRegistry::new();
-    registry.register(OrganizeDirectoryAction::default());
-    registry.register(RustProjectAction::default());
+    let registry = default_registry();
 
     let planner = RulePlanner::new();
     let policy = Policy::default_with_home();

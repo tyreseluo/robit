@@ -5,16 +5,17 @@ version     = { workspace = true }
 edition     = { workspace = true }
 
 [features]
-default = ["ai-http"]
+default = ["ai-http", "web"]
 ai-http = ["dep:reqwest"]
+web = ["dep:reqwest"]
 ai-omnix-mlx = ["dep:qwen3-mlx", "dep:mlx-lm-utils", "dep:mlx-rs"]
 
 [dependencies]
 anyhow = { workspace = true }
-regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 
 qwen3-mlx = { path = "/Users/tyreseluo/Projects/OminiX-MLX/qwen3-mlx", optional = true }
 mlx-lm-utils = { path = "/Users/tyreseluo/Projects/OminiX-MLX/mlx-rs/mlx-lm-utils", optional = true }

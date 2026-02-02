@@ -1,8 +1,16 @@
 use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::{Path, PathBuf};
 
 use crate::types::RiskLevel;
+use crate::utils::expand_tilde;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PolicyConfig {
+    pub allowed_roots: Option<Vec<String>>,
+    pub approval_risk_levels: Option<Vec<String>>,
+}
 
 #[derive(Clone, Debug)]
 pub struct Policy {
@@ -63,5 +71,29 @@ impl Policy {
             "path not allowed by policy: {}",
             canonical.display()
         ))
+    }
+
+    pub fn apply_config(self, config: PolicyConfig) -> Result<Self> {
+        let mut policy = self;
+        if let Some(roots) = config.allowed_roots {
+            policy.allowed_roots = roots.into_iter().map(|root| expand_tilde(&root)).collect();
+        }
+        if let Some(levels) = config.approval_risk_levels {
+            let mut parsed = Vec::new();
+            for level in levels {
+                parsed.push(parse_risk_level(&level)?);
+            }
+            policy.approval_risk_levels = parsed;
+        }
+        Ok(policy)
+    }
+}
+
+fn parse_risk_level(raw: &str) -> Result<RiskLevel> {
+    match raw.trim().to_lowercase().as_str() {
+        "low" => Ok(RiskLevel::Low),
+        "medium" => Ok(RiskLevel::Medium),
+        "high" => Ok(RiskLevel::High),
+        other => Err(anyhow!("unknown risk level: {}", other)),
     }
 }

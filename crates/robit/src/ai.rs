@@ -4,13 +4,19 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::types::{ActionRequest, ActionSpec};
+use crate::types::{ActionRequest, ActionSpec, PlanStep};
 
 #[derive(Clone, Debug)]
 pub enum AiDecision {
     Action(ActionRequest),
-    NeedInput { prompt: String },
+    NeedInput {
+        prompt: String,
+        action: Option<String>,
+        params: Value,
+        missing: Vec<String>,
+    },
     Chat { message: String },
+    Plan { steps: Vec<PlanStep>, message: Option<String> },
     Unknown { message: String },
 }
 
@@ -336,7 +342,7 @@ mod omnix {
             if slice.is_empty() {
                 return Ok(());
             }
-            let mut tokenizer = self.tokenizer.lock().unwrap();
+            let tokenizer = self.tokenizer.lock().unwrap();
             let text = tokenizer
                 .decode(&slice, true)
                 .map_err(|err| anyhow!("decode error: {err:?}"))?;
@@ -377,22 +383,42 @@ struct AiDecisionPayload {
     #[serde(default)]
     params: Option<Value>,
     #[serde(default)]
+    steps: Option<Vec<PlanStepPayload>>,
+    #[serde(default)]
+    missing: Option<Vec<String>>,
+    #[serde(default)]
     message: Option<String>,
     #[serde(default)]
     prompt: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct PlanStepPayload {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    params: Option<Value>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    requires_approval: Option<bool>,
+}
+
 fn parse_decision(content: &str, raw_input: &str) -> Result<AiDecision> {
     let trimmed = content.trim();
-    let json_text = extract_json(content);
-    let payload = if let Some(json_text) = json_text {
-        serde_json::from_str::<AiDecisionPayload>(&json_text).ok()
-    } else {
-        None
-    };
+    let payload = parse_payload_from_text(content);
     let payload = match payload {
         Some(payload) => payload,
         None => {
+            if looks_like_json(trimmed) {
+                return Ok(AiDecision::Unknown {
+                    message: "AI response format invalid; please retry.".to_string(),
+                });
+            }
             if !trimmed.is_empty() {
                 return Ok(AiDecision::Chat {
                     message: trimmed.to_string(),
@@ -403,6 +429,8 @@ fn parse_decision(content: &str, raw_input: &str) -> Result<AiDecision> {
                 name: None,
                 action: None,
                 params: None,
+                steps: None,
+                missing: None,
                 message: Some("AI response was empty".to_string()),
                 prompt: None,
             }
@@ -427,7 +455,44 @@ fn parse_decision(content: &str, raw_input: &str) -> Result<AiDecision> {
             .prompt
             .or(payload.message)
             .unwrap_or_else(|| "need more input".to_string());
-        return Ok(AiDecision::NeedInput { prompt });
+        let missing = payload.missing.unwrap_or_default();
+        let params = payload.params.unwrap_or_else(|| json!({}));
+        let action = payload.action.or(payload.name);
+        return Ok(AiDecision::NeedInput {
+            prompt,
+            action,
+            params,
+            missing,
+        });
+    }
+
+    if ty == "plan" || payload.steps.is_some() {
+        let steps_payload = payload.steps.unwrap_or_default();
+        if steps_payload.is_empty() {
+            return Ok(AiDecision::Unknown {
+                message: payload
+                    .message
+                    .unwrap_or_else(|| "plan has no steps".to_string()),
+            });
+        }
+        let mut steps = Vec::with_capacity(steps_payload.len());
+        for step in steps_payload {
+            let action = step
+                .action
+                .or(step.name)
+                .ok_or_else(|| anyhow!("plan step missing action name"))?;
+            steps.push(PlanStep {
+                id: step.id,
+                action,
+                params: step.params.unwrap_or_else(|| json!({})),
+                note: step.note,
+                requires_approval: step.requires_approval,
+            });
+        }
+        return Ok(AiDecision::Plan {
+            steps,
+            message: payload.message,
+        });
     }
 
     if ty == "chat" {
@@ -443,8 +508,100 @@ fn parse_decision(content: &str, raw_input: &str) -> Result<AiDecision> {
     Ok(AiDecision::Unknown { message })
 }
 
-fn extract_json(content: &str) -> Option<String> {
-    let trimmed = content.trim();
+fn looks_like_json(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with('{') || trimmed.contains("\"type\"") || trimmed.contains("{\"type\"")
+}
+
+fn parse_payload_from_text(content: &str) -> Option<AiDecisionPayload> {
+    let sanitized = sanitize_ai_output(content);
+    for candidate in json_candidates(&sanitized) {
+        if let Some(payload) = try_parse_payload(&candidate) {
+            return Some(payload);
+        }
+    }
+    if let Some(candidate) = fallback_json_slice(&sanitized) {
+        if let Some(payload) = try_parse_payload(&candidate) {
+            return Some(payload);
+        }
+    }
+    None
+}
+
+fn sanitize_ai_output(content: &str) -> String {
+    let mut out = String::new();
+    let mut in_think = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("<think") {
+            if trimmed.contains("</think") {
+                in_think = false;
+            } else {
+                in_think = true;
+            }
+            continue;
+        }
+        if trimmed.contains("</think") {
+            in_think = false;
+            continue;
+        }
+        if in_think {
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn json_candidates(text: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    let mut in_str = false;
+    let mut escape = false;
+    for (idx, ch) in text.char_indices() {
+        if in_str {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(idx);
+                }
+                depth += 1;
+            }
+            '}' => {
+                if depth == 0 {
+                    continue;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start_idx) = start {
+                        candidates.push(text[start_idx..=idx].to_string());
+                        start = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    candidates
+}
+
+fn fallback_json_slice(text: &str) -> Option<String> {
+    let trimmed = text.trim();
     if trimmed.starts_with('{') && trimmed.ends_with('}') {
         return Some(trimmed.to_string());
     }
@@ -456,18 +613,73 @@ fn extract_json(content: &str) -> Option<String> {
     Some(trimmed[start..=end].to_string())
 }
 
+fn try_parse_payload(candidate: &str) -> Option<AiDecisionPayload> {
+    if let Ok(payload) = serde_json::from_str::<AiDecisionPayload>(candidate) {
+        return Some(payload);
+    }
+    let cleaned = strip_trailing_commas(candidate);
+    serde_json::from_str::<AiDecisionPayload>(&cleaned).ok()
+}
+
+fn strip_trailing_commas(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_str = false;
+    let mut escape = false;
+    while let Some(ch) = chars.next() {
+        if in_str {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            out.push(ch);
+            continue;
+        }
+        if ch == '"' {
+            in_str = true;
+            out.push(ch);
+            continue;
+        }
+        if ch == ',' {
+            let mut clone = chars.clone();
+            while let Some(next) = clone.peek() {
+                if next.is_whitespace() {
+                    clone.next();
+                } else {
+                    break;
+                }
+            }
+            if matches!(clone.peek(), Some('}') | Some(']')) {
+                continue;
+            }
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn system_prompt_base() -> &'static str {
     "You are an action planner for robit.\n\
 Return JSON only, no markdown, no extra text.\n\
+Do not include <think> tags or reasoning.\n\
 Allowed output schemas:\n\
 1) {\"type\":\"action\",\"name\":\"...\",\"params\":{...}}\n\
-2) {\"type\":\"need_input\",\"prompt\":\"...\"}\n\
-3) {\"type\":\"chat\",\"message\":\"...\"}\n\
-4) {\"type\":\"unknown\",\"message\":\"...\"}\n\
+2) {\"type\":\"need_input\",\"prompt\":\"...\",\"action\":\"...\",\"params\":{...},\"missing\":[\"path\"]}\n\
+3) {\"type\":\"plan\",\"steps\":[{\"id\":\"s1\",\"action\":\"...\",\"params\":{...},\"note\":\"...\",\"requires_approval\":false}]}\n\
+4) {\"type\":\"chat\",\"message\":\"...\"}\n\
+5) {\"type\":\"unknown\",\"message\":\"...\"}\n\
 Pick an action only from the provided action list.\n\
 Use conversation context to fill missing details.\n\
 If the user is chatting or the request doesn't map to an action, respond with type=chat.\n\
-If the user mentions desktop/桌面, interpret as ~/Desktop."
+If the task needs multiple actions, respond with type=plan.\n\
+If you ask for missing info, return type=need_input and include action + missing fields.\n\
+If the user mentions desktop/桌面, interpret as ~/Desktop.\n\
+If the user says current directory/当前目录 and a Context block provides cwd, use it.\n\
+If the user input looks like a shell command (e.g. ls, pwd), plan using shell.run unless a safer fs action fits.\n\
+If the user asks about system status (cpu/memory/disk/network/uptime), respond with a plan of read-only shell.run probes."
 }
 
 fn system_prompt_with_backend(backend: Option<&str>) -> String {

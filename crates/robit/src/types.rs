@@ -28,6 +28,17 @@ pub struct ActionRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub id: Option<String>,
+    pub action: String,
+    pub params: Value,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub requires_approval: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ActionOutcome {
     pub summary: String,
     pub data: Value,

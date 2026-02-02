@@ -8,7 +8,29 @@ use crate::policy::ActionContext;
 use crate::types::{ActionOutcome, ActionSpec};
 
 pub mod fs_organize;
-pub mod rust_project;
+pub mod fs_ops;
+pub mod shell;
+pub mod browser;
+#[cfg(feature = "web")]
+pub mod web;
+
+pub fn default_registry() -> ActionRegistry {
+    let mut registry = ActionRegistry::new();
+    registry.register(fs_organize::OrganizeDirectoryAction::default());
+    registry.register(fs_ops::ReadFileAction::default());
+    registry.register(fs_ops::WriteFileAction::default());
+    registry.register(fs_ops::ReplaceTextAction::default());
+    registry.register(fs_ops::ListDirAction::default());
+    registry.register(fs_ops::EnsureDirAction::default());
+    registry.register(shell::ShellRunAction::default());
+    registry.register(browser::BrowserOpenUrlAction::default());
+    #[cfg(feature = "web")]
+    {
+        registry.register(web::FetchUrlAction::default());
+        registry.register(web::BraveSearchAction::default());
+    }
+    registry
+}
 
 pub trait ActionHandler: Send + Sync {
     fn name(&self) -> &'static str;
